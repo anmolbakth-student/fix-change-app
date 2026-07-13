@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Attendance Data Fetcher for ZKTeco Devices
+Fetches users and attendance logs from multiple floors/devices
+"""
+
+import sqlite3
+from datetime import datetime, timedelta
+import subprocess
+import sys
+import time
+import os
+import re
+from zk import ZK, const
+
+# ============ CONFIGURATION ============
+
+DATABASE = 'attendance.db'
+
+# Device 1: 2nd Floor
+DEVICE_1 = {
+    'name': '2nd Floor',
+    'wifi_ssid': '35170741',
+    'wifi_password': 'usman1234',
+    'device_ip': '192.168.100.250',
+    'device_port': 4370,
+    'device_password': 0,
+    'floor': '2nd_floor'
+}
+
+# Device 2: 3rd/4th Floor
+DEVICE_2 = {
+    'name': '3rd/4th Floor',
+    'wifi_ssid': '35170742',
+    'wifi_password': 'usman1234',
+    'device_ip': '192.168.68.75',
+    'device_port': 4370,
+    'device_password': 1122,
+    'floor': '3rd_floor'
+}
+
+# ============ DATABASE FUNCTIONS ============
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_database():
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT,
+            name TEXT,
+            device_floor TEXT,
+            is_active INTEGER DEFAULT 1,
+            PRIMARY KEY (user_id, device_floor)
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS attendance_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            device_floor TEXT,
+            timestamp TEXT,
+            punch_type INTEGER,
+            remark_in TEXT,
+            remark_out TEXT,
+            status_override TEXT,
+            is_manually_edited INTEGER DEFAULT 0,
+            last_edited_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, timestamp, punch_type, device_floor)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def save_users(users, floor):
+    if not users:
+        return 0
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    saved_count = 0
+    updated_count = 0
+    
+    for user in users:
+        try:
+            # Check if user already exists
+            cursor.execute('''
+                SELECT is_active FROM users 
+                WHERE user_id = ? AND device_floor = ?
+            ''', (str(user.user_id), floor))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # User exists - UPDATE name but KEEP existing is_active status
+                cursor.execute('''
+                    UPDATE users 
+                    SET name = ?
+                    WHERE user_id = ? AND device_floor = ?
+                ''', (user.name, str(user.user_id), floor))
+                updated_count += 1
+            else:
+                # New user - INSERT as active
+                cursor.execute('''
+                    INSERT INTO users (user_id, name, device_floor, is_active)
+                    VALUES (?, ?, ?, 1)
+                ''', (str(user.user_id), user.name, floor))
+                saved_count += 1
+        except Exception as e:
+            print(f"  ⚠️ Error saving user {user.user_id}: {e}")
+    
+    conn.commit()
+    conn.close()
+    print(f"  ✅ Updated {updated_count} existing users (kept active/inactive status)")
+    return saved_count
+
+def save_attendance_logs(attendance_records, floor):
+    if not attendance_records:
+        return 0
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    new_count = 0
+    
+    for att in attendance_records:
+        try:
+            user_id = str(att.user_id)
+            timestamp = att.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            punch_type = att.punch
+            
+            cursor.execute('''
+                INSERT OR IGNORE INTO attendance_logs 
+                (user_id, device_floor, timestamp, punch_type)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, floor, timestamp, punch_type))
+            
+            if cursor.rowcount > 0:
+                new_count += 1
+                
+        except Exception as e:
+            print(f"  ⚠️ Error saving attendance record: {e}")
+            continue
+    
+    conn.commit()
+    conn.close()
+    return new_count
+
+# ============ WIFI FUNCTIONS ============
+
+def get_current_wifi():
+    try:
+        result = subprocess.run(['nmcli', '-t', '-f', 'ACTIVE,SSID', 'dev', 'wifi'], 
+                              capture_output=True, text=True)
+        for line in result.stdout.split('\n'):
+            if line.startswith('yes:'):
+                return line.split(':')[1]
+        return None
+    except Exception as e:
+        print(f"❌ Error getting current WiFi: {e}")
+        return None
+
+def connect_to_wifi(ssid, password):
+    print(f"  📡 Connecting to WiFi: {ssid}...")
+    try:
+        current = get_current_wifi()
+        if current == ssid:
+            print(f"  ✅ Already connected to {ssid}")
+            return True
+        
+        cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid, 'password', password]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"  ✅ Connected to {ssid}")
+            time.sleep(3)
+            return True
+        else:
+            print(f"  ❌ Failed to connect to {ssid}: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"  ❌ Error connecting to WiFi: {e}")
+        return False
+
+def reconnect_to_wifi(ssid, password=None):
+    print(f"\n  📡 Reconnecting to WiFi: {ssid}...")
+    try:
+        if password:
+            cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid, 'password', password]
+        else:
+            cmd = ['nmcli', 'dev', 'wifi', 'connect', ssid]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"  ✅ Reconnected to {ssid}")
+            time.sleep(2)
+            return True
+        else:
+            print(f"  ❌ Failed to reconnect: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"  ❌ Error reconnecting: {e}")
+        return False
+
+# ============ DEVICE FUNCTIONS ============
+
+def connect_to_device(ip, port, password=0):
+    print(f"  🔌 Connecting to device {ip}:{port}...")
+    try:
+        zk = ZK(ip, port=port, password=password)
+        zk.connect()
+        print(f"  ✅ Connected to device")
+        return zk
+    except Exception as e:
+        print(f"  ❌ Failed to connect to device: {e}")
+        return None
+
+def fetch_users(zk):
+    print("  👤 Fetching users...")
+    try:
+        users = zk.get_users()
+        print(f"  ✅ Found {len(users)} users")
+        return users
+    except Exception as e:
+        print(f"  ❌ Error fetching users: {e}")
+        return None
+
+def fetch_attendance(zk, days=7):
+    print(f"  📋 Fetching attendance (last {days} days)...")
+    try:
+        attendance = zk.get_attendance()
+        
+        cutoff_date = datetime.now() - timedelta(days=days)
+        filtered = []
+        
+        for att in attendance:
+            if att.timestamp.date() >= cutoff_date.date():
+                filtered.append(att)
+        
+        print(f"  ✅ Found {len(filtered)} records (last {days} days)")
+        return filtered
+    except Exception as e:
+        print(f"  ❌ Error fetching attendance: {e}")
+        return None
+
+def disconnect_device(zk):
+    try:
+        zk.disconnect()
+        print("  ✅ Disconnected from device")
+        return True
+    except Exception as e:
+        print(f"  ⚠️ Error disconnecting: {e}")
+        return False
+
+# ============ MAIN PROCESS ============
+
+def process_device(device_config):
+    print(f"\n{'='*50}")
+    print(f"📱 Processing Device: {device_config['name']}")
+    print(f"{'='*50}")
+    
+    if not connect_to_wifi(device_config['wifi_ssid'], device_config['wifi_password']):
+        raise Exception(f"Failed to connect to WiFi: {device_config['wifi_ssid']}")
+    
+    zk = connect_to_device(
+        device_config['device_ip'],
+        device_config['device_port'],
+        device_config['device_password']
+    )
+    if not zk:
+        raise Exception(f"Failed to connect to device: {device_config['device_ip']}")
+    
+    users = fetch_users(zk)
+    if users is None:
+        disconnect_device(zk)
+        raise Exception("Failed to fetch users")
+    
+    saved_users = save_users(users, device_config['floor'])
+    print(f"  ✅ Saved {saved_users} new users to database")
+    
+    attendance = fetch_attendance(zk, 7)
+    if attendance is None:
+        disconnect_device(zk)
+        raise Exception("Failed to fetch attendance")
+    
+    new_count = save_attendance_logs(attendance, device_config['floor'])
+    print(f"  ✅ Added {new_count} new records")
+    
+    disconnect_device(zk)
+    
+    return {
+        'name': device_config['name'],
+        'users': saved_users,
+        'new_records': new_count
+    }
+
+def main():
+    print("="*60)
+    print("📊 ATTENDANCE DATA FETCHER")
+    print("="*60)
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60)
+    
+    try:
+        init_database()
+        
+        original_wifi = get_current_wifi()
+        print(f"\n📡 Current WiFi: {original_wifi}")
+        
+        results = []
+        
+        result1 = process_device(DEVICE_1)
+        results.append(result1)
+        
+        result2 = process_device(DEVICE_2)
+        results.append(result2)
+        
+        if original_wifi:
+            reconnect_to_wifi(original_wifi)
+        else:
+            print("\n⚠️ Could not determine original WiFi")
+        
+        print("\n" + "="*60)
+        print("📊 FETCH COMPLETED - SUMMARY")
+        print("="*60)
+        
+        total_new = 0
+        
+        for result in results:
+            print(f"\n📱 {result['name']}:")
+            print(f"   ✅ New users added: {result['users']}")
+            print(f"   ✅ New records: {result['new_records']}")
+            total_new += result['new_records']
+        
+        print("\n" + "-"*60)
+        print(f"📊 TOTAL: {total_new} new records added")
+        print("="*60)
+        print(f"Completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("="*60)
+        
+        return True
+        
+    except Exception as e:
+        print("\n" + "="*60)
+        print("❌ ERROR OCCURRED!")
+        print("="*60)
+        print(f"Error: {e}")
+        print("="*60)
+        
+        original_wifi = get_current_wifi()
+        if original_wifi:
+            try:
+                reconnect_to_wifi(original_wifi)
+            except:
+                pass
+        
+        return False
+
+if __name__ == "__main__":
+    success = main()
+    sys.exit(0 if success else 1)
